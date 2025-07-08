@@ -38,15 +38,15 @@ print(f"Training on {DEVICE}")
 print(f"Flower {flwr.__version__} / PyTorch {torch.__version__}")
 # disable_progress_bar()
 
-NUM_CLIENTS = 100
+NUM_CLIENTS = 10
 NUM_ROUNDS = 500
 NUM_EPOCHS = 5
 ATTACK_TYPE = "UPA"
-DFL = False
+DFL = True
 STRATEGY = "HRFA"  # 可選 "FedAvg", "AdaFedAdam", "HRFA"
 
 
-DATASET = "cifar10" #"mnist", "cifar10", "svhn", "fashion_mnist"
+DATASET = "mnist" #"mnist", "cifar10", "svhn", "fashion_mnist"
 
 #dynamic experiment
 if DATASET == "cifar10":
@@ -150,7 +150,7 @@ def fit_config(server_round: int):
         "server_round": server_round,  # The current round of federated learning
         # "local_epochs": 1 if server_round < 2 else NUM_EPOCHS,
         "local_epochs": NUM_EPOCHS,
-        "train_mode": "lookahead",
+        "train_mode": "lookahead", #no use
     }
     return config
 

@@ -30,6 +30,7 @@ import pstats
 
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 Q = 0.9
+quick_mode = True  # 是否使用快速模式（只用於測試）
 
 class HRFA(MyFedAvg):
     """
@@ -117,10 +118,11 @@ class HRFA(MyFedAvg):
             for client_proxy, fit_res in fit_results
         }
 
+        if not quick_mode:
         # 2) 更新 client_info_table
-        # update_client_info_table(self.client_info_table, fit_results, self.previous_global_params, self.net, alpha=self.alpha)
+            update_client_info_table(self.client_info_table, fit_results, self.previous_global_params, self.net, alpha=self.alpha)
 
-        # record_metrics(self.metric_history, self.client_info_table)
+            record_metrics(self.metric_history, self.client_info_table)
 
         aggregated_ndarrays = median_aggregation(client_params_list)
 	
@@ -401,25 +403,26 @@ def update_client_info_table(
         raw_params = check_and_clean_params(raw_params, cid)
         client_models_dict[cid] = raw_params
 
-    # shapley_values = calculate_shapley(
-    #     client_models=client_models_dict,
-    #     net=net,
-    #     test_loader=test_loader,
-    #     client_info_table=client_info_table,
-    #     n_permutations=20,       # 可調整採樣次數
-    #     use_robust_agg=True,     # 是否使用防禦聚合
-    #     beta=0.7
-    # )
-    # print("[INFO] shapley_values:", shapley_values)
-    
-    # # 寫入 client_info_table
-    # for cid, shap_val in shapley_values.items():
-    #     client_info_table[cid]["shapley"] = shap_val
-    #     hist = client_info_table[cid].get("shapley_history", [])
-    #     hist.append(shap_val)
-    #     if len(hist) > 5:
-    #         hist.pop(0)
-    #     client_info_table[cid]["shapley_history"] = hist
+    if not quick_mode:
+        shapley_values = calculate_shapley(
+            client_models=client_models_dict,
+            net=net,
+            test_loader=test_loader,
+            client_info_table=client_info_table,
+            n_permutations=20,       # 可調整採樣次數
+            use_robust_agg=True,     # 是否使用防禦聚合
+            beta=0.7
+        )
+        print("[INFO] shapley_values:", shapley_values)
+        
+        # 寫入 client_info_table
+        for cid, shap_val in shapley_values.items():
+            client_info_table[cid]["shapley"] = shap_val
+            hist = client_info_table[cid].get("shapley_history", [])
+            hist.append(shap_val)
+            if len(hist) > 5:
+                hist.pop(0)
+            client_info_table[cid]["shapley_history"] = hist
 
     # 3) 更新其餘資訊 (loss, accuracy, similarity, short_term_rs...)
     for (client_proxy, fit_res) in fit_results:

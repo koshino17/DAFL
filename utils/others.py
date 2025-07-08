@@ -6,6 +6,9 @@ import matplotlib.pyplot as plt
 import seaborn as sns
 import torch
 import math
+import numpy as np
+from typing import List, Tuple, Dict
+from flwr.common import Metrics
 
 def get_parameters(net) -> List[np.ndarray]:
     return [val.detach().cpu().numpy() for _, val in net.state_dict().items()]
@@ -102,9 +105,6 @@ def init_or_check_client_info_table(
                 "previous_params": None,  # 新增：儲存上一輪參數
             }
 
-import numpy as np
-from typing import List
-
 def _l2_distance(params1: List[np.ndarray], params2: List[np.ndarray]) -> float:
     """
     計算兩個參數列表之間的 L2 距離。
@@ -154,7 +154,6 @@ def _l2_distance(params1: List[np.ndarray], params2: List[np.ndarray]) -> float:
     
     # print(f"[DEBUG] 總 L2 距離：{distance:.6f}")
     return float(distance)
-
 
 def check_and_clean_params(
     params: List[np.ndarray],
@@ -218,8 +217,18 @@ def re_aggregate_without(
     aggregated = [p / total_weight for p in weighted_params]
     return aggregated
 
-# def evaluate_model_with_metrics(net, params: List[np.ndarray], test_loader: DataLoader) -> Tuple[float, float]:
-#     """同時回傳 loss 和 accuracy"""
-#     set_parameters(net, params)
-#     loss, accuracy = test(net, DEVICE, test_loader)
-#     return float(loss), float(accuracy)
+def weighted_average(metrics: List[Tuple[int, Metrics]]) -> Metrics:
+    accuracies = []
+    examples = []
+    for num_examples, m in metrics:
+        if "client_accuracy" not in m:
+            print(f"Warning: Missing 'client_accuracy' in metrics for client")
+            continue
+        accuracies.append(num_examples * m["client_accuracy"])
+        examples.append(num_examples)
+    total_examples = sum(examples)
+    if total_examples <= 0:
+        print("Warning: No valid examples for aggregation. Returning 0.0")
+        return {"accuracy": 0.0}
+    return {"accuracy": sum(accuracies) / total_examples}
+

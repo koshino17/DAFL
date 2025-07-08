@@ -33,7 +33,6 @@ def random_on_off(
     current_round,
     online_list: List[str],
     offline_list: List[str],
-    client_num: int,
     offline_rate: float,
     online_rate: float,
     DFL: bool 
@@ -46,7 +45,9 @@ def random_on_off(
         
         if current_round == 1 and online_list and DFL:
             # 在第一輪隨機選擇一個在線客戶端下線
-            offline_num = max(1, (offline_rate*client_num))
+            total_clients = len(online_list) + len(offline_list)
+            offline_num = max(1, int(offline_rate * total_clients))
+            offline_num = min(offline_num, len(online_list))  # 確保不超過在線客戶端數量
             if offline_num > 0:
                 for cid in random.sample(online_list, offline_num):
                     client = client_manager.clients.get(cid)
@@ -56,7 +57,9 @@ def random_on_off(
         # 下線部分在線客戶端
         if current_round % 2 != 0 and current_round != 1 and online_list and DFL:
             # 確保取樣數量不超過列表長度
-            offline_num = max(1, (offline_rate*client_num))
+            total_clients = len(online_list) + len(offline_list)
+            offline_num = max(1, int(offline_rate * total_clients))
+            offline_num = min(offline_num, len(online_list))  # 確保不超過在線客戶端數量
             if offline_num > 0:
                 for cid in random.sample(online_list, offline_num):
                     client = client_manager.clients.get(cid)

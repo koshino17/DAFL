@@ -16,14 +16,44 @@ from utils.weights_utils import weights_substraction, norm
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 class FlowerClient(NumPyClient):
-    def __init__(self, partition_id, net, trainloader, valloader, attack_type: str = None):
+    def __init__(self, partition_id, net, trainloader, valloader, attack_type: str = None, 
+                 max_attack_nums: int = 0, attack_mode: str = "fixed", attack_increase_rounds: int = 100):
         self.partition_id = partition_id
         self.net = net
         self.trainloader = trainloader
         self.valloader = valloader
         self.device = DEVICE
         self.optimizer = torch.optim.SGD(self.net.parameters(), lr=0.001, momentum=0.9)  # Adjusted lr
-        self.attack_type = attack_type
+        self.base_attack_type = attack_type  # 基礎攻擊類型
+        self.max_attack_nums = max_attack_nums  # 最大攻擊者數量
+        self.attack_mode = attack_mode  # 攻擊模式: "fixed" 或 "progressive"
+        self.attack_increase_rounds = attack_increase_rounds  # 漸進模式的增加輪數
+        
+    def get_current_attack_type(self, server_round: int) -> str:
+        """根據當前輪次和攻擊模式決定是否為攻擊者"""
+        if self.base_attack_type is None:
+            return None
+            
+        if self.attack_mode == "fixed":
+            # 固定模式：如果初始設為攻擊者就一直是攻擊者
+            return self.base_attack_type
+            
+        elif self.attack_mode == "progressive":
+            # 漸進模式：攻擊者數量隨輪次增加
+            if server_round <= self.attack_increase_rounds:
+                # 計算當前輪次應該有多少攻擊者
+                current_attack_nums = max(1, int((server_round / self.attack_increase_rounds) * self.max_attack_nums))
+            else:
+                # 超過增加輪數後，維持最大攻擊者數量
+                current_attack_nums = self.max_attack_nums
+            
+            # 如果此客戶端ID小於當前攻擊者數量，則成為攻擊者
+            if int(self.partition_id) < current_attack_nums:
+                return self.base_attack_type
+            else:
+                return None
+        
+        return None
 
     def get_parameters(self, config):
         return [param.cpu().numpy() for param in self.net.state_dict().values()]
@@ -34,9 +64,21 @@ class FlowerClient(NumPyClient):
 
     def fit(self, parameters, config):
         try:
-            if self.attack_type == "UPA":
+            # 獲取當前輪次
+            server_round = config.get("server_round", 1)
+            
+            # 動態決定當前是否為攻擊者
+            current_attack_type = self.get_current_attack_type(server_round)
+            
+            # 如果是漸進模式，輸出攻擊者狀態變化
+            # if self.attack_mode == "progressive":  # 只在前5輪輸出避免太多log
+            #     attack_status = "攻擊者" if current_attack_type else "正常客戶端"
+            #     if attack_status == "攻擊者":
+            #         print(f"Round {server_round}, Client {self.partition_id}: {attack_status}")
+
+            if current_attack_type == "UPA":
                 grad, current_loss = lookahead_UPA_train(self.net, self.trainloader, parameters, config, self.partition_id, verbose=False)
-            elif self.attack_type == "TPA":
+            elif current_attack_type == "TPA":
                 grad, current_loss = lookahead_TPA_train(self.net, self.trainloader, parameters, config, self.partition_id, verbose=False)
             else:
                 grad, current_loss = train(self.net, self.trainloader, parameters, config, self.partition_id, verbose=False)
@@ -112,6 +154,3 @@ def cal_certainty(net, parameters, grad, trainloader, device, optimizer):
     weight = len(trainloader.dataset)
     
     return certainty, weight
-
-
-
