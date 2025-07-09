@@ -30,7 +30,7 @@ import pstats
 
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 Q = 0.9
-quick_mode = True  # 是否使用快速模式（只用於測試）
+quick_mode = False  # 是否使用快速模式（只用於測試）
 
 class HRFA(MyFedAvg):
     """
@@ -102,7 +102,8 @@ class HRFA(MyFedAvg):
         # 選取前面 num_clients_to_select 個客戶端
         selected_clients = sorted_clients[:num_clients_to_select]
         
-        return super().configure_fit(server_round, parameters, client_manager)
+        # 回傳選取的客戶端與 FitIns
+        return [(client, fit_ins) for client in selected_clients]
 
     # @timeit_step("aggregate_fit")
     def aggregate_fit(
@@ -243,10 +244,15 @@ def re_aggregate_without(
     回傳該「去掉某人」後的聚合模型參數。
     """
     # 1. 過濾掉想要排除的 client
-    partial_clients = {
-        cid: params for cid, params in client_params_dict.items() 
-        if cid != exclude_cid
-    }
+    if exclude_cid is None:
+        # 不排除任何客戶端
+        partial_clients = client_params_dict.copy()
+    else:
+        # 排除指定的客戶端
+        partial_clients = {
+            cid: params for cid, params in client_params_dict.items() 
+            if cid != exclude_cid
+        }
     if not partial_clients:
         # 意味著只有這個 cid 一個客戶端在傳參數，移除後就空了
         return None
@@ -258,26 +264,51 @@ def re_aggregate_without(
     # 3. 根據 short_term_rs/long_term_rs 做加權聚合
     weighted_params = None
     total_weight = 0.0
+    weights = {}
+    
     for cid, params in partial_clients.items():
         info = client_info_table.get(cid, {})
-        st_rs = info.get("short_term_rs", 0.0)
-        lt_rs = info.get("long_term_rs", 0.0)
+        st_rs = info.get("short_term_rs", 0.3)  # 預設值改為 0.3
+        lt_rs = info.get("long_term_rs", 0.3)   # 預設值改為 0.3
+        
+        # 確保聲譽分數不會是 NaN 或 Inf
+        st_rs = np.nan_to_num(st_rs, nan=0.3, posinf=1.0, neginf=0.0)
+        lt_rs = np.nan_to_num(lt_rs, nan=0.3, posinf=1.0, neginf=0.0)
         
         combined_weight = beta * lt_rs + (1 - beta) * st_rs
+        combined_weight = max(combined_weight, 0.1)  # 最小權重為 0.1
+        
+        weights[cid] = combined_weight
         total_weight += combined_weight
         
         if weighted_params is None:
             weighted_params = [combined_weight * p for p in params]
         else:
             for idx, p in enumerate(params):
+                # 檢查並處理 NaN/Inf 值
+                if np.isnan(p).any() or np.isinf(p).any():
+                    p = np.nan_to_num(p, nan=0.0, posinf=0.0, neginf=0.0)
                 weighted_params[idx] += combined_weight * p
     
     if total_weight <= 1e-9:
-        # 若發現加權後幾乎為0，代表所有客戶端的聲譽都很低(或某些邏輯錯誤)
-        print("[Warning] re_aggregate_without: total_weight=0 => fallback returns None")
-        return None
+        # 如果仍然總權重太小，使用均等權重
+        print("[Warning] re_aggregate_without: total_weight too small, using equal weights")
+        total_weight = len(partial_clients)
+        weighted_params = None
+        for cid, params in partial_clients.items():
+            if weighted_params is None:
+                weighted_params = [p.copy() for p in params]
+            else:
+                for idx, p in enumerate(params):
+                    weighted_params[idx] += p
     
-    aggregated = [p / total_weight for p in weighted_params]
+    # 最終正規化並檢查 NaN/Inf
+    aggregated = []
+    for p in weighted_params:
+        normalized_p = p / total_weight
+        # 確保結果沒有 NaN/Inf
+        normalized_p = np.nan_to_num(normalized_p, nan=0.0, posinf=0.0, neginf=0.0)
+        aggregated.append(normalized_p)
     return aggregated
 
 def calculate_shapley(
@@ -308,6 +339,7 @@ def calculate_shapley(
     global_model = re_aggregate_without(client_models, exclude_cid=None, 
                                        client_info_table=client_info_table, beta=beta)
     if global_model is None:
+        # 如果無法聚合全局模型，回傳空的 Shapley 值
         return {cid: 0.0 for cid in client_models}
     
     # 基準評估 (loss + accuracy)
@@ -324,31 +356,55 @@ def calculate_shapley(
             
             # 聚合當前集合模型 (加入防禦聚合)
             subset_params = {k: client_models[k] for k in current_set}
-            agg_model = re_aggregate_without(subset_params, exclude_cid=None,
-                                            client_info_table=client_info_table,
-                                            beta=beta) if use_robust_agg else \
-                       median_aggregation(subset_params)
+            if use_robust_agg:
+                agg_model = re_aggregate_without(subset_params, exclude_cid=None,
+                                                client_info_table=client_info_table,
+                                                beta=beta)
+            else:
+                agg_model = median_aggregation(subset_params)
             
-            # 評估當前集合
-            curr_loss, curr_acc = evaluate_model_with_metrics(net, agg_model, test_loader)
+            # 檢查聚合模型是否為 None
+            if agg_model is None:
+                # 跳過此次計算，使用預設值
+                curr_loss, curr_acc = base_loss, 0.0
+            else:
+                # 評估當前集合
+                curr_loss, curr_acc = evaluate_model_with_metrics(net, agg_model, test_loader)
             
             # 計算邊際貢獻 (整合 loss 和 accuracy)
             if prev_set:
-                prev_agg = re_aggregate_without({k: client_models[k] for k in prev_set}, 
-                                              exclude_cid=None, 
-                                              client_info_table=client_info_table,
-                                              beta=beta) if use_robust_agg else \
-                          median_aggregation({k: client_models[k] for k in prev_set})
-                prev_loss, prev_acc = evaluate_model_with_metrics(net, prev_agg, test_loader)
+                if use_robust_agg:
+                    prev_agg = re_aggregate_without({k: client_models[k] for k in prev_set}, 
+                                                  exclude_cid=None, 
+                                                  client_info_table=client_info_table,
+                                                  beta=beta)
+                else:
+                    prev_agg = median_aggregation({k: client_models[k] for k in prev_set})
+                
+                # 檢查前一個聚合模型是否為 None
+                if prev_agg is None:
+                    prev_loss, prev_acc = base_loss, 0.0
+                else:
+                    prev_loss, prev_acc = evaluate_model_with_metrics(net, prev_agg, test_loader)
             else:
                 prev_loss, prev_acc = base_loss, 0.0  # 空集合表現為基準
                 
             # 綜合貢獻值 (可調整權重)
             marginal = (prev_loss - curr_loss) + 0.5*(curr_acc - prev_acc)
             
+            # 檢查並處理 marginal 中的 NaN/Inf
+            if np.isnan(marginal) or np.isinf(marginal):
+                marginal = 0.0
+            
             # 加入聲譽權重調整
             rep_weight = client_info_table[cid].get("reputation", 0.3)
+            rep_weight = np.nan_to_num(rep_weight, nan=0.3, posinf=1.0, neginf=0.0)
+            
             weighted_marginal = marginal * rep_weight
+            
+            # 最終檢查
+            if np.isnan(weighted_marginal) or np.isinf(weighted_marginal):
+                weighted_marginal = 0.0
             
             shapley_values[cid] += weighted_marginal
             total_perm += 1
@@ -359,17 +415,33 @@ def calculate_shapley(
     if total_perm > 0:
         for cid in valid_clients:
             shapley_values[cid] /= total_perm
-        max_shap = max(shapley_values.values())
-        if max_shap > 0:
+            # 處理 NaN/Inf 值
+            shapley_values[cid] = np.nan_to_num(shapley_values[cid], nan=0.0, posinf=1.0, neginf=0.0)
+        
+        # 安全的正規化
+        valid_values = [v for v in shapley_values.values() if not (np.isnan(v) or np.isinf(v))]
+        if valid_values:
+            max_shap = max(valid_values)
+            if max_shap > 1e-9:  # 避免除以接近零的數
+                for cid in shapley_values:
+                    shapley_values[cid] = shapley_values[cid] / max_shap
+                    # 確保在 0~1 範圍內
+                    shapley_values[cid] = max(0.0, min(1.0, shapley_values[cid]))
+            else:
+                # 如果所有值都接近零，設為預設值
+                for cid in shapley_values:
+                    shapley_values[cid] = 0.1
+        else:
+            # 如果所有值都是 NaN/Inf，設為預設值
             for cid in shapley_values:
-                shapley_values[cid] /= max_shap  # 正規化到 0~1 範圍
+                shapley_values[cid] = 0.1
                 
     return shapley_values
 
 def evaluate_model_with_metrics(net, params: List[np.ndarray], test_loader: DataLoader) -> Tuple[float, float]:
     """同時回傳 loss 和 accuracy"""
     set_parameters(net, params)
-    loss, accuracy = test(net, DEVICE, test_loader)
+    loss, accuracy = test(net, test_loader)
     return float(loss), float(accuracy)
 
 def update_client_info_table(
@@ -453,13 +525,21 @@ def update_client_info_table(
 
         # (e) 計算短期RS (與原程式相同)
         loss_std = np.std(loss_history) if len(loss_history) >= 2 else 0
+        loss_std = np.nan_to_num(loss_std, nan=0.0, posinf=0.0, neginf=0.0)
+        
         similarity_now = client_info_table[cid]["similarity"]
+        similarity_now = np.nan_to_num(similarity_now, nan=0.0, posinf=1.0, neginf=0.0)
 
         short_term_rs = (
             0.6 * latest_acc +
             0.2 * (1 - loss_std) +
             0.2 * max(0, similarity_now)
         )
+        
+        # 確保 short_term_rs 在合理範圍內
+        short_term_rs = np.nan_to_num(short_term_rs, nan=0.3, posinf=1.0, neginf=0.0)
+        short_term_rs = max(0.0, min(1.0, short_term_rs))
+        
         client_info_table[cid]["short_term_rs"] = short_term_rs
 
     # === 4) 計算「步驟三：長期 RS (LongTermScore)」 ===
@@ -500,6 +580,11 @@ def update_client_info_table(
             w4 * longterm_reliability +
             w5 * longterm_shapley
         )
+        
+        # 確保 long_term_score 在合理範圍內
+        long_term_score = np.nan_to_num(long_term_score, nan=0.3, posinf=1.0, neginf=0.0)
+        long_term_score = max(0.0, min(1.0, long_term_score))
+        
         client_info_table[cid]["long_term_rs"] = long_term_score
 
     # (E) **步驟四**：將短期 RS 與長期 RS 整合成最終 Reputation
@@ -511,18 +596,24 @@ def update_client_info_table(
     for cid in trained_cids:
         st_rs = client_info_table[cid]["short_term_rs"]
         lt_rs = client_info_table[cid]["long_term_rs"]
+        
+        # 確保數值有效
+        st_rs = np.nan_to_num(st_rs, nan=0.3, posinf=1.0, neginf=0.0)
+        lt_rs = np.nan_to_num(lt_rs, nan=0.3, posinf=1.0, neginf=0.0)
 
         # (1) 加權
         rs_raw = α * st_rs + (1 - α) * lt_rs
 
         # (2) 可選：若短期與長期差異過大 => 懲罰或調整
-        diff_ratio = abs(st_rs - lt_rs) / (lt_rs + 1e-8)
-        if diff_ratio > 0.8:
-            # 舉例：若差異 > 0.8，將最終值乘以 0.9 懲罰
-            rs_raw = rs_raw * 0.9
+        if lt_rs > 1e-8:  # 避免除以零
+            diff_ratio = abs(st_rs - lt_rs) / (lt_rs + 1e-8)
+            if diff_ratio > 0.8:
+                # 舉例：若差異 > 0.8，將最終值乘以 0.9 懲罰
+                rs_raw = rs_raw * 0.9
 
         # (3) 數值裁切 (避免過大或小)
         rs_final = max(0.0, min(1.0, rs_raw))  # 介於 0~1
+        rs_final = np.nan_to_num(rs_final, nan=0.3, posinf=1.0, neginf=0.0)
 
         # 存到 reputation
         client_info_table[cid]["reputation"] = rs_final
@@ -531,26 +622,38 @@ def apply_time_decay(client_info_table: Dict[str, Dict[str, float]],
                      decay_factor: float = 0.95):
     """在每輪開始前對長期RS施加時間衰減"""
     for cid in client_info_table:
-        lt_rs = client_info_table[cid].get("long_term_rs", 1.0)
-        client_info_table[cid]["long_term_rs"] = decay_factor * lt_rs
+        lt_rs = client_info_table[cid].get("long_term_rs", 0.3)
+        # 確保數值有效
+        lt_rs = np.nan_to_num(lt_rs, nan=0.3, posinf=1.0, neginf=0.0)
+        # 應用衰減，但不讓它低於最小值
+        decayed_rs = max(0.1, decay_factor * lt_rs)
+        client_info_table[cid]["long_term_rs"] = decayed_rs
 
 def detect_anomalies(
     client_info_table: Dict[str, Dict[str, float]],
     reputation_threshold: float = 0.3,        # 如果低於此值， reputation 異常
     loss_increase_threshold: float = 0.2,       # 如果最新loss比歷史平均高出20%，則認為異常
     similarity_z_threshold: float = -1.0,       # z-score 小於此閾值視為異常
-    anomaly_score_threshold: float = 1.0        # 累計異常得分達到此值則判定為可疑
+    anomaly_score_threshold: float = 1.5,      # 累計異常得分達到此值則判定為可疑 (提高閾值)
+    reputation_weight: float = 1.0,            # 聲譽異常權重
+    loss_weight: float = 0.7,                  # 損失異常權重 (降低，因為可能是偶發故障)
+    similarity_weight: float = 0.8             # 相似性異常權重
 ) -> None:
     """
     改進版的異常檢測：
     
-    對每個客戶端根據以下指標進行檢測：
-      1. Reputation：若低於設定閾值則累積異常得分
-      2. Loss趨勢：若最新loss相比歷史平均上升超過loss_increase_threshold則累積異常得分
+    對每個客戶端根據以下指標進行加權檢測：
+      1. Reputation：若低於設定閾值則累積異常得分 (權重: reputation_weight)
+      2. Loss趨勢：若最新loss相比歷史平均上升超過loss_increase_threshold則累積異常得分 (權重: loss_weight)
       3. 相似性（Similarity）：計算全體客戶端相似性的平均與標準差，對個別客戶端計算z-score，
-         若z-score低於 similarity_z_threshold 則累積異常得分
+         若z-score低於 similarity_z_threshold 則累積異常得分 (權重: similarity_weight)
          
-    最後累計異常得分超過 anomaly_score_threshold，將此客戶端標記為 suspicious。
+    使用加權機制來區分不同類型異常的嚴重性：
+    - 聲譽異常 (1.0): 最重要，反映長期表現
+    - 相似性異常 (0.8): 重要，可能表示攻擊或數據偏移
+    - 損失異常 (0.7): 相對較輕，可能是偶發故障
+    
+    最後累計異常得分超過 anomaly_score_threshold (預設1.5)，將此客戶端標記為 suspicious。
     """
     import numpy as np
 
@@ -565,7 +668,7 @@ def detect_anomalies(
         # (1) Reputation檢查：低於設定的 reputation_threshold
         rep = info.get("reputation", 1.0)
         if rep < reputation_threshold:
-            anomaly_score += 1.0
+            anomaly_score += reputation_weight
 
         # (2) Loss 趨勢檢查：最新損失相比於歷史平均是否上升過多
         loss_history = info.get("loss_history", [])
@@ -576,7 +679,7 @@ def detect_anomalies(
             if historical_avg_loss > 0:
                 loss_increase_ratio = (current_loss - historical_avg_loss) / historical_avg_loss
                 if loss_increase_ratio > loss_increase_threshold:
-                    anomaly_score += 1.0
+                    anomaly_score += loss_weight
 
         # (3) 相似性檢查：計算z-score檢查相似性是否遠低於平均
         sim = info.get("similarity", 1.0)
@@ -585,7 +688,7 @@ def detect_anomalies(
         else:
             sim_z = 0.0
         if sim_z < similarity_z_threshold:
-            anomaly_score += 1.0
+            anomaly_score += similarity_weight
 
         # 根據累計異常得分來決定是否標記為可疑
         info["is_suspicious"] = anomaly_score >= anomaly_score_threshold
