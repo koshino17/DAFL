@@ -12,4 +12,4 @@
   cd DAFL
 - DAFL
   ```bash
-  python FL.python
+  python FL.py
